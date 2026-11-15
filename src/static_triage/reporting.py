@@ -975,6 +975,16 @@ def _render_signatures(block: dict[str, Any] | None) -> list[str]:
         f"{block.get('covered', 0)} carry a signature made over the bytes in "
         "the file as it stands.",
     ]
+    unreadable = block.get("unreadable") or []
+    if unreadable:
+        lines.extend([
+            "",
+            f"{len(unreadable)} signature"
+            + ("" if len(unreadable) == 1 else "s")
+            + " could not be read, so no publisher is named for "
+            + ("it" if len(unreadable) == 1 else "them")
+            + ". That is not evidence of tampering on its own.",
+        ])
     tampered = block.get("tampered") or []
     if tampered:
         lines.extend([

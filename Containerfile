@@ -7,6 +7,7 @@ ARG FLOSS_VERSION=3.1.1
 
 RUN apk add --no-cache \
         python3 \
+        py3-cryptography \
         libgcc \
         libstdc++ \
     && apk add --no-cache \

@@ -6,8 +6,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from cryptography import x509
-from cryptography.hazmat.primitives.serialization import Encoding, pkcs7
+# Reading the certificate needs a X.509 parser, but checking whether the
+# signature covers the file does not: that is hashing and a byte search. So
+# the parser is optional, and without it a scan still catches a copied or
+# broken signature, just without naming the publisher.
+try:
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding, pkcs7
+
+    CERTIFICATE_PARSER = True
+except ImportError:  # pragma: no cover - exercised by the container build
+    CERTIFICATE_PARSER = False
 
 # Reads the Authenticode certificate embedded in a Windows program and says
 # who it claims to be signed by.
@@ -40,8 +49,11 @@ HEADER_BYTES = 64 * 1024
 WIN_CERTIFICATE_HEADER = 8
 # PKCS#7 SignedData, the only certificate type Authenticode uses.
 WIN_CERT_TYPE_PKCS_SIGNED_DATA = 0x0002
-CODE_SIGNING_EKU = x509.oid.ExtendedKeyUsageOID.CODE_SIGNING
-TIME_STAMPING_EKU = x509.oid.ExtendedKeyUsageOID.TIME_STAMPING
+NO_PARSER_NOTE = (
+    "the certificate was not read (no X.509 parser is installed), so the "
+    "publisher is unknown; whether the signature covers the file was still "
+    "checked"
+)
 
 
 class SignatureError(ValueError):
@@ -283,6 +295,9 @@ def _signing_certificate(
         )
     ] or list(certificates)
 
+    code_signing = x509.oid.ExtendedKeyUsageOID.CODE_SIGNING
+    time_stamping = x509.oid.ExtendedKeyUsageOID.TIME_STAMPING
+
     def usage(certificate: x509.Certificate) -> set[Any]:
         try:
             extension = certificate.extensions.get_extension_for_class(
@@ -292,11 +307,11 @@ def _signing_certificate(
             return set()
         return set(extension.value)
 
-    signing = [leaf for leaf in leaves if CODE_SIGNING_EKU in usage(leaf)]
+    signing = [leaf for leaf in leaves if code_signing in usage(leaf)]
     if signing:
         return signing[0]
     # No explicit code-signing usage: drop anything that is only a timestamp.
-    plain = [leaf for leaf in leaves if TIME_STAMPING_EKU not in usage(leaf)]
+    plain = [leaf for leaf in leaves if time_stamping not in usage(leaf)]
     candidates = plain or leaves
     # Prefer one whose issuer is also present: that is a real chain.
     chained = [leaf for leaf in candidates if leaf.issuer in issuers - {leaf.subject}]
@@ -359,6 +374,11 @@ def read_signature(path: Path, relative_path: str | None = None) -> PESignature:
                 covers_file = None
     except OSError as exc:
         return PESignature(name, False, error=f"could not be read: {exc.strerror or exc}")
+
+    if not CERTIFICATE_PARSER:
+        return PESignature(
+            name, True, covers_file=covers_file, error=NO_PARSER_NOTE
+        )
 
     try:
         certificates = list(pkcs7.load_der_pkcs7_certificates(blob))
@@ -427,7 +447,10 @@ def summarize(signatures: Iterable[PESignature]) -> dict[str, Any]:
     ranked = sorted(signers.values(), key=lambda s: (-len(s["paths"]), s["publisher"] or ""))
     return {
         "files": len(found),
-        "signed": sum(1 for s in found if s.fingerprint),
+        # Carrying a signature and being able to name the signer are
+        # different things: a signature can be present but unparseable.
+        "signed": sum(1 for s in found if s.signed),
+        "identified": sum(1 for s in found if s.fingerprint),
         "covered": sum(1 for s in found if s.covers_file is True),
         "tampered": tampered,
         "unsigned": unsigned,

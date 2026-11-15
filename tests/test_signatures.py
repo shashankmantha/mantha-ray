@@ -5,6 +5,7 @@ import datetime
 import struct
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from cryptography import x509
@@ -13,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from static_triage.models import EntryKind, EntryState, InventoryEntry, RoutingClass
+from static_triage import signatures
 from static_triage.signatures import (
     MISMATCH_EVIDENCE,
     PESignature,
@@ -241,7 +243,10 @@ class SummaryTests(unittest.TestCase):
             PESignature("bin/odd.dll", True, error="the signature could not be parsed"),
         ]
         summary = summarize(found)
-        self.assertEqual((summary["files"], summary["signed"]), (5, 3))
+        # odd.dll carries a signature that could not be parsed: it is signed,
+        # but its signer cannot be named, so it counts in one and not the other.
+        self.assertEqual((summary["files"], summary["signed"]), (5, 4))
+        self.assertEqual(summary["identified"], 3)
         self.assertEqual(summary["covered"], 2)
         self.assertEqual(summary["unsigned"], ["bin/steamclient.dll"])
         self.assertEqual(summary["unreadable"], ["bin/odd.dll"])
@@ -400,6 +405,71 @@ class ScanIntegrationTests(unittest.TestCase):
         self.assertEqual(added, 0)
         self.assertEqual(block["files"], 1)
         self.assertIn("could not be read", block["results"][0]["error"])
+
+
+class WithoutAParserTests(unittest.TestCase):
+    """The tamper check must not depend on the optional X.509 parser.
+
+    The container had no cryptography installed, which broke the whole
+    scanner on import. Reading the certificate is optional; recomputing the
+    digest is plain hashing, so a copied signature is still caught.
+    """
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self._temporary.name)
+        data = bytearray(base64.b64decode((FIXTURES / SIGNED).read_text()))
+        (self.root / "genuine.dll").write_bytes(bytes(data))
+        data[0x600] ^= 0xFF
+        (self.root / "cloned.dll").write_bytes(bytes(data))
+        (self.root / "plain.dll").write_bytes(
+            base64.b64decode((FIXTURES / UNSIGNED).read_text())
+        )
+        patcher = mock.patch.object(signatures, "CERTIFICATE_PARSER", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        self._temporary.cleanup()
+
+    def read(self, name: str) -> PESignature:
+        return read_signature(self.root / name, name)
+
+    def test_a_copied_signature_is_still_caught(self) -> None:
+        cloned = self.read("cloned.dll")
+        self.assertTrue(cloned.signed)
+        self.assertIs(cloned.covers_file, False)
+        self.assertTrue(cloned.tampered)
+
+    def test_a_genuine_signature_is_still_confirmed(self) -> None:
+        genuine = self.read("genuine.dll")
+        self.assertTrue(genuine.signed)
+        self.assertIs(genuine.covers_file, True)
+        self.assertFalse(genuine.tampered)
+
+    def test_the_publisher_is_unknown_and_says_why(self) -> None:
+        genuine = self.read("genuine.dll")
+        self.assertIsNone(genuine.publisher)
+        self.assertIsNone(genuine.fingerprint)
+        self.assertIn("no X.509 parser", genuine.error or "")
+
+    def test_an_unsigned_file_still_reads_as_unsigned(self) -> None:
+        plain = self.read("plain.dll")
+        self.assertFalse(plain.signed)
+        self.assertFalse(plain.tampered)
+
+    def test_the_report_block_still_counts_correctly(self) -> None:
+        block = summarize([self.read(n) for n in
+                           ("genuine.dll", "cloned.dll", "plain.dll")])
+        # Both signed files still count as signed; neither signer is named.
+        self.assertEqual(
+            (block["files"], block["signed"], block["covered"]), (3, 2, 1)
+        )
+        self.assertEqual(block["identified"], 0)
+        self.assertEqual(sorted(block["unreadable"]), ["cloned.dll", "genuine.dll"])
+        self.assertEqual(
+            [t["relative_path"] for t in block["tampered"]], ["cloned.dll"]
+        )
 
 
 class SummaryLineTests(unittest.TestCase):

@@ -128,10 +128,47 @@ class ReadTests(unittest.TestCase):
         self.assertEqual(result.certificate_count, 3)
         self.assertRegex(result.fingerprint or "", r"^[0-9a-f]{64}$")
         self.assertIn("Klei Test", result.subject or "")
-        # The claim is never presented as proven.
+        # The signature was made over the bytes that are in the file.
+        self.assertIs(result.covers_file, True)
+        self.assertFalse(result.tampered)
+        # The publisher claim is never presented as proven.
         payload = result.to_dict()
-        self.assertFalse(payload["verified"])
+        self.assertFalse(payload["chain_verified"])
+        self.assertFalse(payload["tampered"])
         self.assertIn("claimed, not proven", payload["verification_note"])
+        self.assertIn("checked against the file's own bytes", payload["verification_note"])
+
+    def test_a_modified_file_keeps_its_certificate_but_loses_its_digest(self) -> None:
+        """The attack this guards against: a vendor signature on a changed file."""
+
+        path = fixture(SIGNED, self.root)
+        data = bytearray(path.read_bytes())
+        # Flip one byte well inside the code, leaving every header and the
+        # certificate table untouched, as copying a signature across would.
+        data[0x600] ^= 0xFF
+        path.write_bytes(bytes(data))
+
+        result = read_signature(path, "bin/steam_api64.dll")
+        # The certificate still reads as the vendor's...
+        self.assertEqual(result.publisher, "Klei Entertainment Test")
+        self.assertTrue(result.signed)
+        # ...but it does not cover this file.
+        self.assertIs(result.covers_file, False)
+        self.assertTrue(result.tampered)
+        self.assertTrue(result.to_dict()["tampered"])
+
+    def test_a_file_whose_layout_cannot_be_hashed(self) -> None:
+        """An unhashable layout is reported as unknown, never as a match."""
+
+        path = fixture(SIGNED, self.root)
+        data = bytearray(path.read_bytes())
+        (pe_offset,) = struct.unpack_from("<I", data, 0x3C)
+        # Claim far more sections than a real PE has.
+        struct.pack_into("<H", data, pe_offset + 6, 4000)
+        path.write_bytes(bytes(data))
+        result = read_signature(path, "x.dll")
+        self.assertIsNone(result.covers_file)
+        self.assertFalse(result.tampered)
 
     def test_an_unsigned_program(self) -> None:
         result = read_signature(fixture(UNSIGNED, self.root), "bin/crack.dll")
@@ -191,17 +228,28 @@ class SummaryTests(unittest.TestCase):
         klei = "a" * 64
         valve = "b" * 64
         found = [
-            PESignature("bin/game.exe", True, "Klei Entertainment", fingerprint=klei),
-            PESignature("bin/tier0_s.dll", True, "Klei Entertainment", fingerprint=klei),
-            PESignature("bin/steam_api.dll", True, "Valve Corp", fingerprint=valve),
+            PESignature("bin/game.exe", True, "Klei Entertainment", fingerprint=klei,
+                        covers_file=True),
+            PESignature("bin/tier0_s.dll", True, "Klei Entertainment", fingerprint=klei,
+                        covers_file=True),
+            PESignature("bin/steam_api.dll", True, "Valve Corp", fingerprint=valve,
+                        covers_file=False),
             PESignature("bin/steamclient.dll", False, error="the file is not signed"),
             PESignature("bin/odd.dll", True, error="the signature could not be parsed"),
         ]
         summary = summarize(found)
         self.assertEqual((summary["files"], summary["signed"]), (5, 3))
+        self.assertEqual(summary["covered"], 2)
         self.assertEqual(summary["unsigned"], ["bin/steamclient.dll"])
         self.assertEqual(summary["unreadable"], ["bin/odd.dll"])
-        self.assertFalse(summary["verified"])
+        self.assertFalse(summary["chain_verified"])
+        # The file wearing a signature that does not match is called out.
+        self.assertEqual(
+            summary["tampered"],
+            [{"relative_path": "bin/steam_api.dll", "publisher": "Valve Corp"}],
+        )
+        valve_group = [s for s in summary["signers"] if s["publisher"] == "Valve Corp"][0]
+        self.assertFalse(valve_group["covers_file"])
         # Biggest signer first, so the single-file signer stands out.
         self.assertEqual(
             [(s["publisher"], len(s["paths"])) for s in summary["signers"]],
@@ -249,17 +297,29 @@ class WalkTests(unittest.TestCase):
         klei = "a" * 64
         text = "\n".join(render(Path("/games/ds"), [
             PESignature("bin/game.exe", True, "Klei Entertainment", fingerprint=klei,
-                        issuer="Vendor CA", not_after="2027-01-02T00:00:00+00:00"),
+                        issuer="Vendor CA", not_after="2027-01-02T00:00:00+00:00",
+                        covers_file=True),
             PESignature("bin/tier0_s.dll", True, "Klei Entertainment", fingerprint=klei,
-                        issuer="Vendor CA", not_after="2027-01-02T00:00:00+00:00"),
+                        issuer="Vendor CA", not_after="2027-01-02T00:00:00+00:00",
+                        covers_file=True),
             PESignature("bin/steamclient.dll", False, error="the file is not signed"),
         ]))
-        self.assertIn("3 programs found, 2 signed.", text)
+        self.assertIn("3 programs found, 2 signed, 2 whose signature matches", text)
         self.assertIn("Klei Entertainment \u2014 2 programs", text)
         self.assertIn("issued by Vendor CA, expires 2027-01-02", text)
         self.assertIn("Not signed (1):", text)
         self.assertIn("bin/steamclient.dll", text)
-        self.assertIn("claimed, not proven", text)
+        self.assertIn("claimed rather", text)
+        self.assertNotIn("DOES NOT MATCH", text)
+
+    def test_report_shouts_about_a_mismatched_signature(self) -> None:
+        text = "\n".join(render(Path("/games/dk2"), [
+            PESignature("steam_api64.dll", True, "Valve Corp", fingerprint="c" * 64,
+                        covers_file=False),
+        ]))
+        self.assertIn("*** SIGNATURE DOES NOT MATCH THE FILE (1) ***", text)
+        self.assertIn("steam_api64.dll (claims Valve Corp)", text)
+        self.assertIn("not every file here matches this signature", text)
 
 
 if __name__ == "__main__":

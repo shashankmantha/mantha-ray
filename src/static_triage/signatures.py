@@ -12,15 +12,24 @@ from cryptography.hazmat.primitives.serialization import Encoding, pkcs7
 # Reads the Authenticode certificate embedded in a Windows program and says
 # who it claims to be signed by.
 #
-# What this does NOT do, and must not be read as doing: it does not verify
-# the certificate chain against a trusted root, and it does not check the
-# file against the digest inside the signature. A publisher name here is
-# therefore *claimed*, not proven -- anyone can self-sign a file with
-# "Valve Corp" in the subject. What it is good for is the two questions that
-# need no trust store: is this file signed at all, and is it signed by the
-# same certificate as the files around it.
+# It also recomputes the file's Authenticode digest and checks whether the
+# signature was made over the bytes that are there now. That matters: a
+# signature blob can be lifted from a genuine vendor file and pasted onto a
+# modified one, and the certificate still reads as the vendor's. A file whose
+# digest no longer matches is wearing someone else's signature.
+#
+# What this does NOT do: it does not verify the certificate chain against a
+# trusted root. A publisher name is therefore *claimed*, not proven -- anyone
+# can self-sign a file with "Valve Corp" in the subject. Taken together with
+# the digest check the claim is much stronger, because a forger must then
+# either hold the vendor's key or leave the file unmodified.
 
 CERTIFICATE_DIRECTORY_INDEX = 4
+# Authenticode digests seen in the wild: SHA-256 now, SHA-1 on files signed
+# before about 2016, and both on dual-signed ones.
+DIGEST_ALGORITHMS = ("sha256", "sha1")
+HASH_CHUNK_BYTES = 1024 * 1024
+MAX_SECTIONS = 96
 PE32_MAGIC = 0x10B
 PE32PLUS_MAGIC = 0x20B
 MAX_CERTIFICATE_BYTES = 4 * 1024 * 1024
@@ -40,6 +49,19 @@ class SignatureError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class _Layout:
+    """The header offsets needed to hash a PE the way Authenticode does."""
+
+    checksum_offset: int
+    certificate_entry_offset: int
+    size_of_headers: int
+    section_table_offset: int
+    section_count: int
+    certificate_offset: int
+    certificate_size: int
+
+
+@dataclass(frozen=True, slots=True)
 class PESignature:
     """What one program's embedded certificate claims."""
 
@@ -53,7 +75,16 @@ class PESignature:
     not_before: str | None = None
     not_after: str | None = None
     certificate_count: int = 0
+    # True when the signature was made over the bytes now in the file,
+    # False when it was not, None when it could not be worked out.
+    covers_file: bool | None = None
     error: str | None = None
+
+    @property
+    def tampered(self) -> bool:
+        """Signed, but the signature does not cover the file as it stands."""
+
+        return self.signed and self.covers_file is False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,11 +97,14 @@ class PESignature:
             "not_before": self.not_before,
             "not_after": self.not_after,
             "certificate_count": self.certificate_count,
+            "covers_file": self.covers_file,
+            "tampered": self.tampered,
             "error": self.error,
-            "verified": False,
+            "chain_verified": False,
             "verification_note": (
-                "The certificate chain and the signed file digest are not "
-                "checked, so the publisher is claimed, not proven."
+                "The signature is checked against the file's own bytes, but "
+                "the certificate chain is not checked against a trusted root, "
+                "so the publisher is claimed, not proven."
             ),
         }
 
@@ -81,8 +115,8 @@ def _read_exactly(data: bytes, offset: int, length: int, what: str) -> bytes:
     return data[offset : offset + length]
 
 
-def _certificate_table(data: bytes) -> tuple[int, int]:
-    """The file offset and size of the certificate table, or (0, 0)."""
+def _certificate_table(data: bytes) -> _Layout:
+    """The certificate table's position, plus what Authenticode hashing needs."""
 
     if len(data) < 0x40 or data[:2] != b"MZ":
         raise SignatureError("not a PE file (no MZ header)")
@@ -105,14 +139,90 @@ def _certificate_table(data: bytes) -> tuple[int, int]:
         "<I", _read_exactly(data, optional_header + (92 if magic == PE32_MAGIC else 108), 4,
                             "data directory count")
     )
-    if number_of_directories <= CERTIFICATE_DIRECTORY_INDEX:
-        return 0, 0
-    entry = directories + CERTIFICATE_DIRECTORY_INDEX * 8
-    # For this one directory the first field is a file offset, not an RVA.
-    offset, size = struct.unpack_from(
-        "<II", _read_exactly(data, entry, 8, "certificate table entry")
+    (size_of_headers,) = struct.unpack_from(
+        "<I", _read_exactly(data, optional_header + 60, 4, "size of headers")
     )
-    return offset, size
+    section_count, size_of_optional_header = struct.unpack_from(
+        "<HH", _read_exactly(data, pe_offset + 6, 2, "section count")
+        + _read_exactly(data, pe_offset + 20, 2, "optional header size")
+    )
+    entry = directories + CERTIFICATE_DIRECTORY_INDEX * 8
+    offset = size = 0
+    if number_of_directories > CERTIFICATE_DIRECTORY_INDEX:
+        # For this one directory the first field is a file offset, not an RVA.
+        offset, size = struct.unpack_from(
+            "<II", _read_exactly(data, entry, 8, "certificate table entry")
+        )
+    return _Layout(
+        checksum_offset=optional_header + 64,
+        certificate_entry_offset=entry,
+        size_of_headers=size_of_headers,
+        section_table_offset=optional_header + size_of_optional_header,
+        section_count=section_count,
+        certificate_offset=offset,
+        certificate_size=size,
+    )
+
+
+def _hashed_ranges(data: bytes, layout: _Layout, file_size: int) -> list[tuple[int, int]]:
+    """The byte ranges Authenticode signs: everything but the checksum, the
+    certificate table's directory entry, and the certificate table itself."""
+
+    if layout.section_count > MAX_SECTIONS:
+        raise SignatureError("implausible number of sections")
+    after_checksum = layout.checksum_offset + 4
+    after_entry = layout.certificate_entry_offset + 8
+    if not 0 < after_checksum <= layout.certificate_entry_offset:
+        raise SignatureError("the PE header fields are out of order")
+    if after_entry > layout.size_of_headers:
+        raise SignatureError("the headers are shorter than the data directories")
+    ranges = [
+        (0, layout.checksum_offset),
+        (after_checksum, layout.certificate_entry_offset - after_checksum),
+        (after_entry, layout.size_of_headers - after_entry),
+    ]
+
+    sections = []
+    for index in range(layout.section_count):
+        header = _read_exactly(
+            data, layout.section_table_offset + index * 40, 40, "section header"
+        )
+        raw_size, raw_offset = struct.unpack_from("<II", header, 16)
+        if raw_size:
+            sections.append((raw_offset, raw_size))
+    sections.sort()
+
+    hashed = layout.size_of_headers
+    for raw_offset, raw_size in sections:
+        if raw_offset + raw_size > file_size:
+            raise SignatureError("a section runs past the end of the file")
+        ranges.append((raw_offset, raw_size))
+        hashed += raw_size
+
+    # Anything after the last section but before the certificate table.
+    trailing = file_size - layout.certificate_size - hashed
+    if trailing > 0:
+        ranges.append((hashed, trailing))
+    elif trailing < 0:
+        raise SignatureError("the sections overlap the certificate table")
+    return [(offset, length) for offset, length in ranges if length > 0]
+
+
+def _digests(handle: Any, ranges: list[tuple[int, int]]) -> list[bytes]:
+    """Authenticode digests of the given ranges, one per algorithm."""
+
+    hashers = [hashlib.new(name) for name in DIGEST_ALGORITHMS]
+    for offset, length in ranges:
+        handle.seek(offset)
+        remaining = length
+        while remaining > 0:
+            chunk = handle.read(min(remaining, HASH_CHUNK_BYTES))
+            if not chunk:
+                raise SignatureError("the file ended while it was being hashed")
+            remaining -= len(chunk)
+            for hasher in hashers:
+                hasher.update(chunk)
+    return [hasher.digest() for hasher in hashers]
 
 
 def _signed_data(table: bytes, size: int) -> bytes:
@@ -210,44 +320,58 @@ def read_signature(path: Path, relative_path: str | None = None) -> PESignature:
     """Read one program's embedded certificate. Never raises for a bad file."""
 
     name = relative_path if relative_path is not None else path.name
+    covers_file: bool | None = None
     try:
+        file_size = path.stat().st_size
         with path.open("rb") as handle:
             head = handle.read(HEADER_BYTES)
             try:
-                offset, size = _certificate_table(head)
+                layout = _certificate_table(head)
             except SignatureError as exc:
                 return PESignature(name, False, error=str(exc))
             except (struct.error, ValueError) as exc:
                 return PESignature(name, False, error=f"malformed PE header: {exc}")
-            if offset == 0 or size == 0:
+            size = layout.certificate_size
+            if layout.certificate_offset == 0 or size == 0:
                 return PESignature(name, False, error="the file is not signed")
             if size > MAX_CERTIFICATE_BYTES:
                 return PESignature(
                     name, True, error="the certificate table is implausibly large"
                 )
-            handle.seek(offset)
+            handle.seek(layout.certificate_offset)
             table = handle.read(size)
+
+            try:
+                blob = _signed_data(table, size)
+            except SignatureError as exc:
+                return PESignature(name, True, error=str(exc))
+            except (struct.error, ValueError) as exc:
+                return PESignature(name, True, error=f"malformed signature: {exc}")
+
+            # Does the signature cover the bytes that are in the file now? The
+            # digest it was made over sits inside the blob, so finding the
+            # recomputed digest there settles it. Not finding one is reported
+            # as a mismatch only when the digest could be computed at all.
+            try:
+                digests = _digests(handle, _hashed_ranges(head, layout, file_size))
+                covers_file = any(digest in blob for digest in digests)
+            except (SignatureError, struct.error, ValueError, OSError):
+                covers_file = None
     except OSError as exc:
         return PESignature(name, False, error=f"could not be read: {exc.strerror or exc}")
-
-    try:
-        blob = _signed_data(table, size)
-    except SignatureError as exc:
-        return PESignature(name, True, error=str(exc))
-    except (struct.error, ValueError) as exc:
-        return PESignature(name, True, error=f"malformed signature: {exc}")
 
     try:
         certificates = list(pkcs7.load_der_pkcs7_certificates(blob))
     except Exception as exc:  # the library raises several unrelated types
         return PESignature(
-            name, True, error=f"the signature could not be parsed: {type(exc).__name__}"
+            name, True, covers_file=covers_file,
+            error=f"the signature could not be parsed: {type(exc).__name__}",
         )
 
     certificate = _signing_certificate(certificates)
     if certificate is None:
         return PESignature(
-            name, True, certificate_count=0,
+            name, True, certificate_count=0, covers_file=covers_file,
             error="the signature holds no certificates",
         )
     return PESignature(
@@ -262,6 +386,7 @@ def read_signature(path: Path, relative_path: str | None = None) -> PESignature:
         not_before=certificate.not_valid_before_utc.isoformat(),
         not_after=certificate.not_valid_after_utc.isoformat(),
         certificate_count=len(certificates),
+        covers_file=covers_file,
     )
 
 
@@ -272,7 +397,13 @@ def summarize(signatures: Iterable[PESignature]) -> dict[str, Any]:
     signers: dict[str, dict[str, Any]] = {}
     unsigned: list[str] = []
     unreadable: list[str] = []
+    tampered: list[dict[str, Any]] = []
     for signature in found:
+        if signature.tampered:
+            tampered.append({
+                "relative_path": signature.relative_path,
+                "publisher": signature.publisher,
+            })
         if signature.fingerprint:
             signer = signers.setdefault(
                 signature.fingerprint,
@@ -285,6 +416,9 @@ def summarize(signatures: Iterable[PESignature]) -> dict[str, Any]:
                 },
             )
             signer["paths"].append(signature.relative_path)
+            signer["covers_file"] = signer.get("covers_file", True) and (
+                signature.covers_file is True
+            )
         elif signature.signed:
             unreadable.append(signature.relative_path)
         else:
@@ -294,10 +428,12 @@ def summarize(signatures: Iterable[PESignature]) -> dict[str, Any]:
     return {
         "files": len(found),
         "signed": sum(1 for s in found if s.fingerprint),
+        "covered": sum(1 for s in found if s.covers_file is True),
+        "tampered": tampered,
         "unsigned": unsigned,
         "unreadable": unreadable,
         "signers": ranked,
-        "verified": False,
+        "chain_verified": False,
     }
 
 
@@ -330,8 +466,20 @@ def render(root: Path, signatures: list[PESignature]) -> list[str]:
     lines = [
         "",
         f"Signing certificates in {root}",
-        f"{summary['files']} programs found, {summary['signed']} signed.",
+        f"{summary['files']} programs found, {summary['signed']} signed, "
+        f"{summary['covered']} whose signature matches the file.",
     ]
+    if summary["tampered"]:
+        lines.extend([
+            "",
+            f"  *** SIGNATURE DOES NOT MATCH THE FILE ({len(summary['tampered'])}) ***",
+            "      These carry a certificate, but it was not made over the bytes",
+            "      now in the file: either the file was modified after signing, or",
+            "      a signature was copied onto it from somewhere else.",
+        ])
+        for item in summary["tampered"][:MAX_LISTED_PATHS]:
+            claim = f" (claims {item['publisher']})" if item["publisher"] else ""
+            lines.append(f"      {item['relative_path']}{claim}")
     for signer in summary["signers"]:
         paths = signer["paths"]
         lines.extend([
@@ -341,6 +489,8 @@ def render(root: Path, signatures: list[PESignature]) -> list[str]:
             f"      issued by {signer['issuer'] or 'unknown'}, "
             f"expires {(signer['not_after'] or '?')[:10]}",
         ])
+        if signer.get("covers_file") is False:
+            lines.append("      WARNING: not every file here matches this signature")
         for path in paths[:MAX_LISTED_PATHS]:
             lines.append(f"      {path}")
         if len(paths) > MAX_LISTED_PATHS:
@@ -354,9 +504,10 @@ def render(root: Path, signatures: list[PESignature]) -> list[str]:
                 lines.append(f"      ... and {len(paths) - MAX_LISTED_PATHS} more")
     lines.extend([
         "",
-        "The certificate chain and the signed file digest are NOT checked, so a",
-        "publisher name here is claimed, not proven. What it does show is which",
-        "files share a signer, and which carry no signature at all.",
+        "Each signature is checked against the file's own bytes, so a copied or",
+        "post-signing change is caught. The certificate chain is NOT checked",
+        "against a trusted root, so a publisher name is still claimed rather",
+        "than proven: a self-signed file can name any publisher it likes.",
     ])
     return lines
 

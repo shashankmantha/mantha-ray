@@ -541,3 +541,51 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- as part of a scan --------------------------------------------------------
+
+# Appended to a file's inventory evidence, so a mismatch becomes a review item
+# and is counted in the summary's review flags like any other inventory finding.
+MISMATCH_EVIDENCE = (
+    "signature does not match the file: the certificate claims {publisher}, "
+    "but it was not made over the bytes in this file (copied signature, or "
+    "modified after signing)"
+)
+UNKNOWN_PUBLISHER = "an unnamed publisher"
+
+
+def check_entries(
+    entries: list[Any],
+    target: Path,
+) -> tuple[dict[str, Any], int]:
+    """Read the signature of every Windows program in a finished inventory.
+
+    Adds evidence to files whose signature does not cover them, and returns
+    the report block together with how many evidence lines were added.
+    """
+
+    found: list[PESignature] = []
+    added = 0
+    for entry in entries:
+        if (
+            getattr(entry, "kind", None) is None
+            or entry.kind.value != "regular_file"
+            or entry.state.value != "inventoried"
+            or getattr(entry.routing_class, "value", None)
+            not in {"pe_executable", "pe_dll"}
+        ):
+            continue
+        signature = read_signature(target / entry.relative_path, entry.relative_path)
+        found.append(signature)
+        if signature.tampered:
+            entry.evidence.append(
+                MISMATCH_EVIDENCE.format(
+                    publisher=signature.publisher or UNKNOWN_PUBLISHER
+                )
+            )
+            added += 1
+
+    block = summarize(found)
+    block["results"] = [signature.to_dict() for signature in found]
+    return block, added

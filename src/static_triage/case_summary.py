@@ -270,6 +270,26 @@ def coverage_gap_lines(data: object) -> list[str]:
     return lines
 
 
+def signature_lines(data: object) -> list[str]:
+    if not isinstance(data, dict) or not data.get("files"):
+        return []
+    tampered = [t for t in (data.get("tampered") or []) if isinstance(t, dict)]
+    signed = data.get("signed", 0)
+    line = (
+        f"Signed   {signed} of {data['files']} programs"
+        f" · {data.get('covered', 0)} match their signature"
+    )
+    if not tampered:
+        return [line]
+    lines = [line + f" · {len(tampered)} DO NOT MATCH:"]
+    for item in tampered[:MAX_GAP_LINES]:
+        claim = clean(item.get("publisher") or "unnamed publisher", 60)
+        lines.append(f"  {clean(item.get('relative_path', '?'), 70)}  claims {claim}")
+    if len(tampered) > MAX_GAP_LINES:
+        lines.append(f"  … and {len(tampered) - MAX_GAP_LINES:,} more (see report.json)")
+    return lines
+
+
 def integrity_line(data: object) -> str:
     if not isinstance(data, dict):
         return "not re-checked (older case)"
@@ -345,6 +365,7 @@ def summarize(case: Path) -> str:
         + (f" · {len(findings)} detection(s)" if findings else ""),
         f"YARA-X   {yara_line(analyzers.get('yara'))}",
         f"Hashes   {integrity_line(report.get('integrity'))}",
+        *signature_lines(report.get("signatures")),
         "",
         *analyzer_lines("capa", analyzers.get("capa")),
         *capa_combination_lines(analyzers.get("capa")),

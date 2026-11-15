@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 
 
-SCHEMA_VERSION = "0.2.13"
+SCHEMA_VERSION = "0.2.14"
 
 
 class RoutingClass(StrEnum):

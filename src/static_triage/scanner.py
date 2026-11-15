@@ -21,6 +21,7 @@ from . import result_cache
 from .capa import _CAPA_ROUTING_CLASSES
 from .floss import _FLOSS_ROUTING_CLASSES
 from .integrity import verify_hashes
+from .signatures import check_entries
 from .yara_scan import PACKS_MOUNT, YaraBatchResult, run_yara_stage, summary_message
 from .inventory import inventory_tree
 from .models import EntryKind, EntryState, InventoryEntry, ToolInfo
@@ -170,6 +171,26 @@ def run_inventory_scan(
         target,
         config.limits,
     )
+
+    # Reading the embedded certificates is part of taking stock of the files,
+    # so it runs with the inventory rather than as a stage of its own.
+    signature_block = None
+    try:
+        signature_block, flagged = check_entries(entries, target)
+    except Exception:  # never let this stop a scan
+        signature_block, flagged = None, 0
+    if signature_block is not None:
+        summary.review_flags += flagged
+        signed = signature_block["signed"]
+        message = (
+            f"Signatures read: {signed} of {signature_block['files']} programs signed"
+        )
+        if signature_block["tampered"]:
+            count = len(signature_block["tampered"])
+            message += (
+                f"; {count} whose signature does not match the file"
+            )
+        _emit_progress(on_progress, "inventory", "running", message + ".")
 
     _emit_progress(
         on_progress,
@@ -645,6 +666,7 @@ def run_inventory_scan(
         ),
         stage_timings=stage_timer.to_dict(),
         integrity=integrity,
+        signatures=signature_block,
     )
 
     _emit_progress(

@@ -71,6 +71,12 @@ flowchart TB
 
 capa describes what code *can* do, not what it's for, and games do much of what malware does: they read raw keyboard input, check for debuggers, take screenshots, record from the microphone for voice chat, read the CPU name from the registry, download updates and run JIT-compiled code. A few capa rules are also broader than their names suggest (for example "schedule task via at" matches any program containing the letters "at" and a time-like string). So Mantha Ray judges each file on its own, never adds capabilities up across a folder, and treats those routine capabilities as context only. A file is flagged as **Suspicious Capabilities** only for a combination in that one file (or one of a short list of rules legitimate software doesn't need). `summary.sh` lists each flagged file with the capabilities behind it, and applies the current rules to older cases too.
 
+### Code signatures
+
+Every Windows program is checked against the certificate embedded in it. The report says how many are signed, groups them by signer, and — the part that matters — recomputes each file's Authenticode digest to check the signature was actually made over the bytes in the file. A signature lifted from a genuine vendor binary and pasted onto a modified one fails that check and is raised as a review item.
+
+The certificate chain is **not** verified against a trusted root, so a publisher name is claimed rather than proven: a self-signed file can name any publisher it likes. What the check does establish without a trust store is whether a file is signed at all, whether its signature covers it, and whether it shares a signer with the files around it. `scripts/signatures.sh FOLDER` runs the same check outside a scan.
+
 ### Coverage
 
 Next to the verdict, every report says how many files were **fully checked**: every analyzer that applies to a file finished it (a match still counts as checked). ClamAV and YARA-X apply to every file, capa to Windows and Linux programs, and FLOSS to Windows programs. Files that were only partly checked (for example, plain strings instead of FLOSS's decoding) are counted separately, and every gap is listed with its reason in `report.json`, `report.md`, the web results and `scripts/summary.sh`. If no YARA rule packs are installed, YARA-X isn't counted, and the report says so.

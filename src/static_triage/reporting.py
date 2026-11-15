@@ -209,6 +209,7 @@ def write_case_artifacts(
     resources: dict[str, Any] | None = None,
     stage_timings: dict[str, Any] | None = None,
     integrity: IntegrityResult | None = None,
+    signatures: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the complete inventory-milestone artifact set."""
 
@@ -470,6 +471,7 @@ def write_case_artifacts(
         "summary": summary.to_dict(),
         "coverage": coverage,
         "integrity": integrity.to_dict() if integrity is not None else None,
+        "signatures": signatures,
         "resources": resources,
         "stage_timings": stage_timings or {},
         "warnings": warnings,
@@ -931,6 +933,50 @@ COVERAGE_STATUS_LABELS = {
     "not_run": "not run",
 }
 MAX_MARKDOWN_GAPS = 100
+
+
+def _render_signatures(block: dict[str, Any] | None) -> list[str]:
+    if not block or not block.get("files"):
+        return []
+    lines = [
+        "",
+        "## Code signatures",
+        "",
+        f"{block['signed']} of {block['files']} Windows programs are signed; "
+        f"{block.get('covered', 0)} carry a signature made over the bytes in "
+        "the file as it stands.",
+    ]
+    tampered = block.get("tampered") or []
+    if tampered:
+        lines.extend([
+            "",
+            f"**{len(tampered)} signature"
+            + ("" if len(tampered) == 1 else "s")
+            + " did not match the file.** Either the file was changed after "
+            "signing, or a signature was copied onto it from elsewhere.",
+            "",
+        ])
+        for item in tampered[:50]:
+            claim = item.get("publisher")
+            lines.append(
+                f"- {_markdown_code(item.get('relative_path', '?'))}"
+                + (f" — claims {_markdown_text(claim)}" if claim else "")
+            )
+    signers = block.get("signers") or []
+    if signers:
+        lines.extend(["", "| Signed by | Programs | Expires |", "| --- | ---: | --- |"])
+        for signer in signers[:25]:
+            lines.append(
+                f"| {_markdown_text(signer.get('publisher') or 'unnamed')} "
+                f"| {len(signer.get('paths') or []):,} "
+                f"| {_markdown_text((signer.get('not_after') or '?')[:10])} |"
+            )
+    lines.extend([
+        "",
+        "The certificate chain is not checked against a trusted root, so a "
+        "publisher name is claimed rather than proven.",
+    ])
+    return lines
 
 
 def _render_coverage(
@@ -1742,6 +1788,7 @@ def _render_markdown(
     ]
 
     lines.extend(_render_coverage(report.get("coverage"), incomplete_reasons))
+    lines.extend(_render_signatures(report.get("signatures")))
 
     lines.extend(
         [

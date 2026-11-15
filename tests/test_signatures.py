@@ -12,8 +12,11 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from static_triage.models import EntryKind, EntryState, InventoryEntry, RoutingClass
 from static_triage.signatures import (
+    MISMATCH_EVIDENCE,
     PESignature,
+    check_entries,
     _signing_certificate,
     find_programs,
     read_signature,
@@ -320,6 +323,99 @@ class WalkTests(unittest.TestCase):
         self.assertIn("*** SIGNATURE DOES NOT MATCH THE FILE (1) ***", text)
         self.assertIn("steam_api64.dll (claims Valve Corp)", text)
         self.assertIn("not every file here matches this signature", text)
+
+
+class ScanIntegrationTests(unittest.TestCase):
+    """Signature reading runs with the inventory and feeds the review items."""
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self._temporary.name)
+        (self.root / "bin").mkdir()
+
+    def tearDown(self) -> None:
+        self._temporary.cleanup()
+
+    def entry(self, path: str, routing=RoutingClass.PE_DLL, **changes) -> InventoryEntry:
+        return InventoryEntry(
+            relative_path=path,
+            kind=changes.pop("kind", EntryKind.REGULAR_FILE),
+            state=changes.pop("state", EntryState.INVENTORIED),
+            routing_class=routing,
+            **changes,
+        )
+
+    def place(self, name: str, source: str, tamper: bool = False) -> None:
+        data = bytearray(base64.b64decode((FIXTURES / source).read_text()))
+        if tamper:
+            data[0x600] ^= 0xFF
+        (self.root / name).write_bytes(bytes(data))
+
+    def test_a_mismatch_becomes_a_review_item(self) -> None:
+        self.place("bin/game.exe", SIGNED)
+        self.place("bin/steam_api64.dll", SIGNED, tamper=True)
+        self.place("bin/crack.dll", UNSIGNED)
+        entries = [
+            self.entry("bin/game.exe", RoutingClass.PE_EXECUTABLE),
+            self.entry("bin/steam_api64.dll"),
+            self.entry("bin/crack.dll"),
+        ]
+        block, added = check_entries(entries, self.root)
+
+        self.assertEqual(added, 1)
+        self.assertEqual((block["files"], block["signed"], block["covered"]), (3, 2, 1))
+        self.assertEqual(
+            block["tampered"],
+            [{"relative_path": "bin/steam_api64.dll",
+              "publisher": "Klei Entertainment Test"}],
+        )
+        self.assertEqual(block["unsigned"], ["bin/crack.dll"])
+        self.assertEqual(len(block["results"]), 3)
+
+        # Only the mismatched file is flagged, and it says why.
+        flagged = [e for e in entries if e.evidence]
+        self.assertEqual([e.relative_path for e in flagged], ["bin/steam_api64.dll"])
+        self.assertIn("Klei Entertainment Test", flagged[0].evidence[0])
+        self.assertIn("copied signature", flagged[0].evidence[0])
+        self.assertTrue(MISMATCH_EVIDENCE.startswith("signature does not match"))
+
+    def test_only_windows_programs_are_looked_at(self) -> None:
+        self.place("bin/game.exe", SIGNED)
+        (self.root / "bin" / "level.pak").write_bytes(b"PACK" + b"\0" * 100)
+        (self.root / "bin" / "gone.dll").write_bytes(b"MZ")
+        entries = [
+            self.entry("bin/game.exe", RoutingClass.PE_EXECUTABLE),
+            self.entry("bin/level.pak", RoutingClass.OTHER),
+            self.entry("bin/script.lua", RoutingClass.TEXT),
+            self.entry("bin/tool", RoutingClass.ELF),
+            self.entry("bin/gone.dll", state=EntryState.ERROR),
+            self.entry("bin", RoutingClass.OTHER, kind=EntryKind.DIRECTORY),
+        ]
+        block, added = check_entries(entries, self.root)
+        self.assertEqual((block["files"], added), (1, 0))
+        self.assertEqual(block["results"][0]["relative_path"], "bin/game.exe")
+
+    def test_a_missing_file_is_recorded_not_raised(self) -> None:
+        block, added = check_entries([self.entry("bin/vanished.dll")], self.root)
+        self.assertEqual(added, 0)
+        self.assertEqual(block["files"], 1)
+        self.assertIn("could not be read", block["results"][0]["error"])
+
+
+class SummaryLineTests(unittest.TestCase):
+    def test_lines(self) -> None:
+        from static_triage.case_summary import signature_lines
+
+        self.assertEqual(signature_lines(None), [])
+        self.assertEqual(signature_lines({"files": 0}), [])
+        clean = signature_lines({"files": 18, "signed": 6, "covered": 6, "tampered": []})
+        self.assertEqual(clean, ["Signed   6 of 18 programs · 6 match their signature"])
+        bad = signature_lines({
+            "files": 18, "signed": 6, "covered": 5,
+            "tampered": [{"relative_path": "bin/steam_api64.dll", "publisher": "Valve Corp"}],
+        })
+        self.assertIn("1 DO NOT MATCH:", bad[0])
+        self.assertIn("bin/steam_api64.dll  claims Valve Corp", bad[1])
 
 
 if __name__ == "__main__":

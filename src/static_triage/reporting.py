@@ -210,6 +210,7 @@ def write_case_artifacts(
     stage_timings: dict[str, Any] | None = None,
     integrity: IntegrityResult | None = None,
     signatures: dict[str, Any] | None = None,
+    selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the complete inventory-milestone artifact set."""
 
@@ -472,6 +473,7 @@ def write_case_artifacts(
         "coverage": coverage,
         "integrity": integrity.to_dict() if integrity is not None else None,
         "signatures": signatures,
+        "selection": selection,
         "resources": resources,
         "stage_timings": stage_timings or {},
         "warnings": warnings,
@@ -933,6 +935,33 @@ COVERAGE_STATUS_LABELS = {
     "not_run": "not run",
 }
 MAX_MARKDOWN_GAPS = 100
+
+
+def _render_selection(block: dict[str, Any] | None) -> list[str]:
+    if not block:
+        return []
+    patterns = block.get("patterns") or []
+    lines = [
+        "",
+        "## Targeted scan",
+        "",
+        f"This scan looked at {block.get('matched', 0):,} file"
+        + ("" if block.get("matched") == 1 else "s")
+        + f" matching {len(patterns)} pattern"
+        + ("" if len(patterns) == 1 else "s")
+        + ", not the whole folder. Every count above describes those files.",
+        "",
+    ]
+    lines.extend(f"- {_markdown_code(p)}" for p in patterns[:50])
+    unmatched = block.get("unmatched") or []
+    if unmatched:
+        lines.extend([
+            "",
+            "Nothing matched: "
+            + ", ".join(_markdown_code(p) for p in unmatched[:50])
+            + ".",
+        ])
+    return lines
 
 
 def _render_signatures(block: dict[str, Any] | None) -> list[str]:
@@ -1789,6 +1818,7 @@ def _render_markdown(
 
     lines.extend(_render_coverage(report.get("coverage"), incomplete_reasons))
     lines.extend(_render_signatures(report.get("signatures")))
+    lines.extend(_render_selection(report.get("selection")))
 
     lines.extend(
         [

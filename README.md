@@ -71,6 +71,17 @@ flowchart TB
 
 capa describes what code *can* do, not what it's for, and games do much of what malware does: they read raw keyboard input, check for debuggers, take screenshots, record from the microphone for voice chat, read the CPU name from the registry, download updates and run JIT-compiled code. A few capa rules are also broader than their names suggest (for example "schedule task via at" matches any program containing the letters "at" and a time-like string). So Mantha Ray judges each file on its own, never adds capabilities up across a folder, and treats those routine capabilities as context only. A file is flagged as **Suspicious Capabilities** only for a combination in that one file (or one of a short list of rules legitimate software doesn't need). `summary.sh` lists each flagged file with the capabilities behind it, and applies the current rules to older cases too.
 
+### Scanning only some files
+
+A full scan shares one time budget across everything, so a big file can run out of time while the rest finish. `scripts/rescan.sh` scans only the files you name, and because nothing else is competing, each one gets the whole stage budget and the whole memory budget:
+
+```
+./scripts/rescan.sh ~/games/DontStarve bin/steam_api.dll
+./scripts/rescan.sh ~/games/DontStarve 'bin/steam*.dll' bin/Steam.dll
+```
+
+Paths are relative to the folder and written the way the report writes them, so they can be copied straight out of a summary. A pattern can be an exact path, a glob, a folder (which takes everything beneath it) or a bare file name (which matches that file anywhere). The result is an ordinary case with its own report; its counts describe the files you named, and a `selection` block records which patterns were used and which matched nothing.
+
 ### Code signatures
 
 Every Windows program is checked against the certificate embedded in it. The report says how many are signed, groups them by signer, and — the part that matters — recomputes each file's Authenticode digest to check the signature was actually made over the bytes in the file. A signature lifted from a genuine vendor binary and pasted onto a modified one fails that check and is raised as a review item.

@@ -21,6 +21,7 @@ from . import result_cache
 from .capa import _CAPA_ROUTING_CLASSES
 from .floss import _FLOSS_ROUTING_CLASSES
 from .integrity import verify_hashes
+from .selection import Selection
 from .signatures import check_entries
 from .yara_scan import PACKS_MOUNT, YaraBatchResult, run_yara_stage, summary_message
 from .inventory import inventory_tree
@@ -122,6 +123,18 @@ def _hashes(entries: list[InventoryEntry], routing: frozenset | set) -> list[str
     ]
 
 
+def _file_limit(
+    preset_max: float | None,
+    stage_budget: float,
+    selection: Selection | None,
+) -> float | None:
+    """The per-file ceiling, lifted to the whole budget for targeted runs."""
+
+    if selection is None:
+        return preset_max
+    return max(stage_budget, preset_max or 0.0)
+
+
 def run_inventory_scan(
     staging_subdirectory: str,
     config: ScanConfig,
@@ -167,10 +180,23 @@ def run_inventory_scan(
         "Inventorying and hashing files...",
     )
 
+    selection = Selection.of(config.only)
+
     entries, summary = inventory_tree(
         target,
         config.limits,
+        selection,
     )
+
+    if selection is not None:
+        message = (
+            f"Targeted scan: {summary.regular_files:,} of the folder's files "
+            f"matched {len(selection.patterns)} pattern"
+            + ("" if len(selection.patterns) == 1 else "s")
+        )
+        if selection.unmatched:
+            message += f"; nothing matched {', '.join(selection.unmatched)}"
+        _emit_progress(on_progress, "inventory", "running", message + ".")
 
     # Reading the embedded certificates is part of taking stock of the files,
     # so it runs with the inventory rather than as a stage of its own.
@@ -416,9 +442,10 @@ def run_inventory_scan(
                     config.limits
                     .capa_file_timeout_seconds
                 ),
-                file_timeout_max_seconds=(
-                    config.limits
-                    .capa_file_timeout_max_seconds
+                file_timeout_max_seconds=_file_limit(
+                    config.limits.capa_file_timeout_max_seconds,
+                    config.limits.capa_total_timeout_seconds,
+                    selection,
                 ),
                 workers=config.limits.analysis_workers,
                 memory_budget_mib=config.limits.analysis_memory_mib,
@@ -540,9 +567,10 @@ def run_inventory_scan(
                     config.limits
                     .floss_file_timeout_seconds
                 ),
-                file_timeout_max_seconds=(
-                    config.limits
-                    .floss_file_timeout_max_seconds
+                file_timeout_max_seconds=_file_limit(
+                    config.limits.floss_file_timeout_max_seconds,
+                    config.limits.floss_total_timeout_seconds,
+                    selection,
                 ),
                 workers=config.limits.analysis_workers,
                 memory_budget_mib=config.limits.analysis_memory_mib,
@@ -667,6 +695,11 @@ def run_inventory_scan(
         stage_timings=stage_timer.to_dict(),
         integrity=integrity,
         signatures=signature_block,
+        selection=(
+            None
+            if selection is None
+            else selection.to_dict(summary.regular_files)
+        ),
     )
 
     _emit_progress(

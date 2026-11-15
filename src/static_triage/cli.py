@@ -96,6 +96,19 @@ def build_parser(
     )
 
     scan.add_argument(
+        "--only",
+        metavar="PATH",
+        action="append",
+        default=None,
+        help=(
+            "scan only this file, folder or glob, relative to the scanned "
+            "folder, as paths are written in the report (bin/steam_api.dll). "
+            "Repeat for more. Each file gets the whole stage budget, so a "
+            "file that timed out in a full scan gets far longer here"
+        ),
+    )
+
+    scan.add_argument(
         "--resource-profile",
         metavar="JSON",
         default=None,
@@ -112,6 +125,39 @@ def build_parser(
         action="store_true",
         help=argparse.SUPPRESS,
     )
+
+    rescan = subparsers.add_parser(
+        "rescan",
+        help="scan only named files in a folder, each with the whole budget",
+    )
+
+    rescan.add_argument("folder", type=Path, help="the folder to scan")
+
+    rescan.add_argument(
+        "only",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "file, folder or glob to look at, relative to the folder and "
+            "written as the report writes it (bin/steam_api.dll)"
+        ),
+    )
+
+    rescan.add_argument(
+        "--results",
+        type=Path,
+        default=None,
+        help="where to write the case (default: alongside previous cases)",
+    )
+
+    rescan.add_argument(
+        "--profile",
+        default="high",
+        help="resource preset: constrained, balanced or high (default: high)",
+    )
+
+    rescan.add_argument("--image", default="static-triage:core")
+    rescan.add_argument("--container-engine", default="docker")
 
     packs = subparsers.add_parser(
         "packs",
@@ -422,6 +468,70 @@ def _run_web(
         return _print_error(str(exc))
 
 
+def _run_rescan(args: argparse.Namespace) -> int:
+    """Run a targeted scan on the host, printing progress as it goes."""
+
+    from .container.command import DockerScanRequest
+    from .container.controller import DockerScanController, HostScanError
+    from .resource_profiles import resolve_profile
+
+    folder = args.folder.expanduser().resolve()
+    if not folder.is_dir():
+        print(f"Not a folder: {folder}", file=sys.stderr)
+        return 2
+
+    results = (
+        args.results.expanduser().resolve()
+        if args.results is not None
+        else Path.home() / "static-triage-results"
+    )
+    try:
+        results.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"The results folder could not be created: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        profile = resolve_profile(args.profile)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    controller = DockerScanController(
+        engine=args.container_engine,
+        image=args.image,
+    )
+
+    request = DockerScanRequest(
+        source_directory=folder,
+        results_directory=results,
+        image=args.image,
+        resource_profile=profile,
+        only=tuple(args.only),
+    )
+
+    def show(stage: str, status: str, message: str) -> None:
+        if status != "running" or stage in {"inventory", "report"}:
+            print(f"  {stage:9} {message}", flush=True)
+
+    print(f"Scanning {len(args.only)} pattern(s) in {folder}")
+    try:
+        controller.preflight()
+        result = controller.scan(request, on_status=print, on_progress=show)
+    except HostScanError as exc:
+        print(f"\nScan failed: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        controller.cancel()
+        print("\nStopped.", file=sys.stderr)
+        return 130
+
+    print(f"\n{result.status}  {result.case_id}")
+    print(f"  {result.case_directory}")
+    print(f"\nFor the detail:  cd {result.case_directory} && ./summary.sh")
+    return 0
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -446,6 +556,9 @@ def main(
         from .packs.commands import run_packs_command
 
         return run_packs_command(args)
+
+    if args.command == "rescan":
+        return _run_rescan(args)
 
     if args.command == "packs-check":
         from .packs.commands import run_packs_check
@@ -480,6 +593,7 @@ def main(
             "changed": profile.changed_fields(),
             "effective_workers": profile.effective_workers,
         },
+        only=tuple(getattr(args, "only", None) or ()),
     )
 
     progress_callback = (

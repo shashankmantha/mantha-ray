@@ -270,6 +270,22 @@ def coverage_gap_lines(data: object) -> list[str]:
     return lines
 
 
+def selection_lines(data: object) -> list[str]:
+    if not isinstance(data, dict) or not data.get("patterns"):
+        return []
+    patterns = [str(p) for p in data["patterns"]]
+    lines = [
+        f"Targeted {data.get('matched', 0)} file"
+        + ("" if data.get("matched") == 1 else "s")
+        + " matched, whole folder NOT scanned: "
+        + clean(", ".join(patterns), 90)
+    ]
+    unmatched = [str(p) for p in (data.get("unmatched") or [])]
+    if unmatched:
+        lines.append("  nothing matched: " + clean(", ".join(unmatched), 90))
+    return lines
+
+
 def signature_lines(data: object) -> list[str]:
     if not isinstance(data, dict) or not data.get("files"):
         return []
@@ -366,6 +382,7 @@ def summarize(case: Path) -> str:
         f"YARA-X   {yara_line(analyzers.get('yara'))}",
         f"Hashes   {integrity_line(report.get('integrity'))}",
         *signature_lines(report.get("signatures")),
+        *selection_lines(report.get("selection")),
         "",
         *analyzer_lines("capa", analyzers.get("capa")),
         *capa_combination_lines(analyzers.get("capa")),

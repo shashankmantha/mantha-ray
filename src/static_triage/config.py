@@ -65,6 +65,9 @@ class ScanConfig:
     # The resolved resource profile, recorded in the report. It does
     # not change behavior; ``limits`` is what the scanner enforces.
     resource_profile: dict[str, Any] | None = None
+    # A targeted scan: only these paths or patterns are taken in. Empty
+    # means the whole folder.
+    only: tuple[str, ...] = ()
 
     def validate(self) -> None:
         """Validate the complete scanner configuration."""

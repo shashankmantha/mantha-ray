@@ -40,6 +40,9 @@ class DockerScanRequest:
     local_packs_directory: Path | None = None
     # Earlier capa and FLOSS results, by file hash; mounted read-only at /cache.
     cache_directory: Path | None = None
+    # A targeted scan: only these paths, folders or globs are looked at,
+    # relative to the scanned folder. Empty means the whole folder.
+    only: tuple[str, ...] = ()
 
     @property
     def timeout_seconds(self) -> int:
@@ -310,4 +313,9 @@ def build_docker_command(
             sort_keys=True,
             separators=(",", ":"),
         ),
+        *[
+            argument
+            for pattern in request.only
+            for argument in ("--only", pattern)
+        ],
     ]

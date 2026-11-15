@@ -13,6 +13,7 @@ from .filetypes import (
     filename_evidence,
     open_regular_nofollow,
 )
+from .selection import Selection
 from .models import (
     EntryKind,
     EntryState,
@@ -72,8 +73,13 @@ def _hash_fd(fd: int, chunk_bytes: int) -> str:
 def inventory_tree(
     root: Path,
     limits: ScanLimits,
+    selection: Selection | None = None,
 ) -> tuple[list[InventoryEntry], InventorySummary]:
-    """Inventory a directory without following symlinks."""
+    """Inventory a directory without following symlinks.
+
+    With a selection, only the files it names are taken in. Directories are
+    still walked to reach them, but nothing else is hashed or recorded.
+    """
 
     entries: list[InventoryEntry] = []
     summary = InventorySummary()
@@ -138,6 +144,13 @@ def inventory_tree(
         for child in children:
             child_path = Path(child.path)
             relative = _safe_relative(child_path, root)
+
+            if (
+                selection is not None
+                and not child.is_dir(follow_symlinks=False)
+                and not selection.matches(relative)
+            ):
+                continue
 
             try:
                 info = child.stat(follow_symlinks=False)
